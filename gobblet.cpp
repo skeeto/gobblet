@@ -3,8 +3,6 @@
 
 #include <cstdint>
 #include <vector>
-#include <queue>
-#include <set>
 #include <iostream>
 #include <string>
 #include <cstdio>
@@ -21,6 +19,130 @@ typedef std::uint64_t State;
 // new piece of the corresponding (negated) size.
 struct Move { int start, end; };
 
+struct Arena
+{
+    char *beg{};
+    char *end{};
+
+    Arena(ptrdiff_t cap) : beg{new char[cap]}, end{beg+cap} {}
+    // NOTE: implementing ~Arena requires also tracking ownership of the
+    // underlying region, i.e. scratch copies don't free
+
+    template<typename T, typename ...A>
+    T *make(ptrdiff_t count = 1, A ...args)
+    {
+        ptrdiff_t size = sizeof(T);
+        ptrdiff_t pad  = (size_t)end & (alignof(T) - 1);
+        ptrdiff_t avail = end - beg;
+        if (count >= (avail - pad)/size) {
+            __builtin_trap();  // DELETEME
+            throw std::bad_alloc();
+        }
+        T *r = (T *)(end -= pad + size*count);
+        for (ptrdiff_t i = 0; i < count; i++) {
+            new (r+i) T(args...);
+        }
+        return r;
+    }
+};
+
+// SplitMix64
+static std::uint64_t hash(State h)
+{
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9u;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebu;
+    h ^= h >> 31;
+    return h;
+}
+
+struct MoveSet
+{
+    struct Node
+    {
+        Node* child[4]{};
+        Node* next{};
+        State s{};
+        Move  m{};
+    };
+
+    Node     *head{};
+    ptrdiff_t len{};
+    Node    **tail = &head;
+    Node     *root{};
+
+    bool insert(Arena *a, State s, Move m = {0, 0})
+    {
+        Node **n = &root;
+        for (std::uint64_t h = hash(s); *n; h <<= 2) {
+            if (s == (*n)->s) {
+                return 0;
+            }
+            n = &(*n)->child[h>>62];
+        }
+        *n = a->make<Node>();
+        (*n)->s = s;
+        (*n)->m = m;
+        *tail = *n;
+        tail = &(*n)->next;
+        len++;
+        return 1;
+    }
+
+    // TODO: disable mutation after copy
+};
+
+struct Queue
+{
+    struct Node
+    {
+        Node *next;
+        State s;
+    };
+
+    Node  *head{};
+    Node **tail = &head;
+    Node  *free{};
+
+    bool empty()
+    {
+        return tail == &head;
+    }
+
+    State front()
+    {
+        return head->s;
+    }
+
+    void pop()
+    {
+        Node *n = head;
+        head = n->next;
+        if (!head) {
+            tail = &head;
+        }
+        n->next = free;
+        free = n;
+    }
+
+    void push(Arena *a, State s)
+    {
+        Node *n = free;
+        if (n) {
+            free = n->next;
+            n->next = 0;
+        } else {
+            n = a->make<Node>();
+        }
+        n->s = s;
+        *tail = n;
+        tail = &n->next;
+    }
+
+    // TODO: delete copy operator and constructor
+};
+
 class Game
 {
     // Define rule variations:
@@ -31,7 +153,7 @@ class Game
     // Store all possible game states using MSI hash map (ref. Chris Wellons
     // https://nullprogram.com/blog/2022/08/08/) from each 54-bit bitboard key
     // to its win/loss/draw value packed in the upper 10 bits.
-    std::vector<State> hash_map{};
+    State* hash_map{};
     const int HASH_EXP = 29;
     const std::size_t HASH_MASK = (1ull << HASH_EXP) - 1;
     const State STATE_EMPTY = 0x3; // 0x0 is the (valid) initial board state
@@ -52,26 +174,15 @@ class Game
         }
     }
 
-    // SplitMix64
-    std::uint64_t hash(State h)
-    {
-        h ^= h >> 30;
-        h *= 0xbf58476d1ce4e5b9u;
-        h ^= h >> 27;
-        h *= 0x94d049bb133111ebu;
-        h ^= h >> 31;
-        return h;
-    }
-
     // First step of retrograde analysis: breadth-first search all states from
     // initial board, returning queue of solved (game-over won or lost) states.
-    std::queue<State> search(State s0)
+    Queue *search(State s0, Arena *a, Arena scratch)
     {
         std::cout << "Searching... " << std::flush;
         int count = 0;
-        std::queue<State> solved;
-        std::queue<State> q;
-        q.push(s0);
+        Queue *solved = a->make<Queue>();
+        Queue q;
+        q.push(&scratch, s0);
         *lookup(s0) = s0;
         while (!q.empty())
         {
@@ -83,16 +194,18 @@ class Game
             {
                 // Queue game-over state as win or loss in 0 moves.
                 *lookup(current) = current | pack(value, 0);
-                solved.push(current);
+                solved->push(a, current);
             }
             else
             {
                 // Mark all other states as tentative draw (value 0), recording
                 // number of possible (winning) moves.
-                std::vector<Move> moves = get_moves(current);
-                *lookup(current) = current | pack(0, moves.size());
-                for (auto& m : moves)
+                Arena temp = *a;
+                MoveSet moves = get_moves(current, &temp);
+                *lookup(current) = current | pack(0, moves.len);
+                for (MoveSet::Node *n = moves.head; n; n = n->next)
                 {
+                    Move m = n->m;
                     State next = canonical(swap(move(current, m)));
 
                     // Trade time for extra lookup of next state for memory
@@ -100,7 +213,7 @@ class Game
                     State* next_ptr = lookup(next);
                     if (*next_ptr == STATE_EMPTY)
                     {
-                        q.push(next);
+                        q.push(&scratch, next);
                         *next_ptr = next;
                     }
                 }
@@ -113,17 +226,20 @@ class Game
     // Second step of retrograde analysis: work backward breadth-first from
     // initial queue of game-over states, propagating solved win/loss values
     // and incrementing depth to win.
-    void solve(std::queue<State> solved)
+    void solve(Queue *solved, Arena *perm, Arena scratch)
     {
         std::cout << "Solving... " << std::flush;
         int count = 0;
-        while (!solved.empty())
+        while (!solved->empty())
         {
-            State current = solved.front();
-            solved.pop();
+            State current = solved->front();
+            solved->pop();
             ++count;
-            for (auto& prev : get_unmoves(current))
+            Arena temp = scratch;
+            MoveSet unmoves = get_unmoves(current, &temp);
+            for (MoveSet::Node *n = unmoves.head; n; n = n->next)
             {
+                State prev = n->s;
                 State* prev_ptr = lookup(prev);
                 if (unpack_value(*prev_ptr) == 0)
                 {
@@ -143,7 +259,7 @@ class Game
                             // player and queue solved state.
                             *prev_ptr = prev |
                                 pack(-1, unpack_moves(*current_ptr) + 1);
-                            solved.push(prev);
+                            solved->push(perm, prev);
                         }
                     }
                     else
@@ -151,7 +267,7 @@ class Game
                         // At least one winning move; record win and queue.
                         *prev_ptr = prev |
                             pack(1, unpack_moves(*current_ptr) + 1);
-                        solved.push(prev);
+                        solved->push(perm, prev);
                     }
                 }
             }
@@ -182,12 +298,14 @@ public:
     }
 
     // With this key-value encoding, the best move maximizes next game state.
-    Move best_move(State s)
+    Move best_move(State s, Arena a)
     {
         Move best{};
         State max_next = 0;
-        for (auto& m : get_moves(s))
+        MoveSet moves = get_moves(s, &a);
+        for (MoveSet::Node *n = moves.head; n; n = n->next)
         {
+            Move m = n->m;
             State next = *lookup(canonical(swap(move(s, m))));
             if (next > max_next)
             {
@@ -199,35 +317,39 @@ public:
     }
 
     // Initialize and solve game for these rules, loading from disk for speed.
-    Game(int num_sizes, int num_per_size, bool allow_move)
+    Game(int num_sizes, int num_per_size, bool allow_move, Arena *a, Arena scratch)
     {
-        init(num_sizes, num_per_size, allow_move);
+        init(num_sizes, num_per_size, allow_move, a, scratch);
     }
 
-    void init(int num_sizes, int num_per_size, bool allow_move)
+    void init(int num_sizes, int num_per_size, bool allow_move, Arena *a, Arena scratch)
     {
         this->num_sizes = num_sizes;
         this->num_per_size = num_per_size;
         this->allow_move = allow_move;
-        hash_map.clear();
-        hash_map.resize(HASH_MASK + 1, STATE_EMPTY);
+        hash_map = a->make<State>(HASH_MASK + 1, STATE_EMPTY);
 
         // Use cached evaluation of game states if available.
         std::string filename = "gobblet_" + std::to_string(num_sizes) + "_" +
             std::to_string(num_per_size) + "_" +
             std::to_string(allow_move) + ".dat";
-        std::FILE* fid = std::fopen(filename.c_str(), "rb");
+        std::FILE* fid = 0;//std::fopen(filename.c_str(), "rb");
         if (fid != 0)
         {
             std::cout << "Loading from " << filename << std::endl;
-            std::fread(&hash_map[0], sizeof(State), hash_map.size(), fid);
+            std::fread(&hash_map[0], sizeof(State), HASH_MASK+1, fid);
         }
         else
         {
             // Cache not found; solve game and save for future re-use.
-            solve(search(0));
+            Arena temp = *a;
+            solve(search(0, &temp, scratch), &temp, scratch);
             fid = std::fopen(filename.c_str(), "wb");
-            std::fwrite(&hash_map[0], sizeof(State), hash_map.size(), fid);
+            #if 0
+            for (size_t i = 0; i < HASH_MASK+1; i++) {
+                std::fwrite(hash_map+i, sizeof(State), 1, fid);
+            }
+            #endif
         }
         std::fclose(fid);
     }
@@ -332,11 +454,10 @@ public:
 
     // Return possible moves for current player, ignoring whether
     // get_terminal_value(s) != 0.
-    std::vector<Move> get_moves(State s)
+    MoveSet get_moves(State s, Arena *a)
     {
-        std::vector<Move> moves;
         int played[3] = { 0 };
-        std::set<State> states;
+        MoveSet states;
 
         // Try to move pieces already on the board.
         for (int start = 0; start < 9; ++start)
@@ -362,12 +483,8 @@ public:
                     {
                         Move m{start, end};
                         State next = canonical(swap(move(s, m)));
-                        if (states.find(next) == states.end())
-                        {
-                            // Only list moves distinct up to symmetry.
-                            moves.push_back(m);
-                            states.insert(next);
-                        }
+                        // Only list moves distinct up to symmetry.
+                        states.insert(a, next, m);
                     }
                 }
             }
@@ -385,22 +502,18 @@ public:
                     {
                         Move m{-size, end};
                         State next = canonical(swap(move(s, m)));
-                        if (states.find(next) == states.end())
-                        {
-                            moves.push_back(m);
-                            states.insert(next);
-                        }
+                        states.insert(a, next, m);
                     }
                 }
             }
         }
-        return moves;
+        return states;
     }
 
     // Return list of "unmoves," or previous states leading to given state.
-    std::set<State> get_unmoves(State s)
+    MoveSet get_unmoves(State s, Arena *a)
     {
-        std::set<State> unmoves;
+        MoveSet unmoves;
         s = swap(s);
         for (int end = 0; end < 9; ++end)
         {
@@ -426,7 +539,7 @@ public:
                             // Verify that the game wasn't already over.
                             if (get_terminal_value(prev) == 0)
                             {
-                                unmoves.insert(canonical(prev));
+                                unmoves.insert(a, canonical(prev));
                             }
                         }
                     }
@@ -436,7 +549,7 @@ public:
                 State prev = move(s, Move{-size, end});
                 if (get_terminal_value(prev) == 0)
                 {
-                    unmoves.insert(canonical(prev));
+                    unmoves.insert(a, canonical(prev));
                 }
             }
         }
@@ -478,7 +591,7 @@ public:
     }
 
     // Play game, allowing rewind and showing optimal moves.
-    void play()
+    void play(Arena scratch)
     {
         std::vector<State> states(1, 0);
         int turn = 1;
@@ -520,7 +633,7 @@ public:
                         std::cout << (value == 1 ? "Win" : "Lose") << " in " <<
                             moves << " moves with";
                     }
-                    Move best = best_move(s);
+                    Move best = best_move(s, scratch);
                     std::cout << " (" <<
                         best.start << ", " << best.end << ")." << std::endl;
                 }
@@ -543,17 +656,7 @@ int main()
     int num_sizes = 3;
     int num_per_size = 2;
     bool allow_move = true;
-    while (true)
-    {
-        std::cout << "Enter rules (num_sizes, num_per_size, allow_move): ";
-        std::cin >> num_sizes >> num_per_size >> allow_move;
-        if (num_sizes >= 1 && num_sizes <= 3 &&
-            num_per_size >= 1 && num_per_size <= (num_sizes < 3 ? 9 : 2))
-        {
-            break;
-        }
-        std::cout << "Rule variant not supported." << std::endl;
-    }
-    Game game{num_sizes, num_per_size, allow_move};
-    game.play();
+    Arena perm{1LL<<33};
+    Arena scratch{1LL<<35};
+    Game game{num_sizes, num_per_size, allow_move, &perm, scratch};
 }
